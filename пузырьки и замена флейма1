@@ -62,7 +62,7 @@ local Config = {
         HoldM1ToTarget   = true,
         IgnoreWhenEating = true,
 
-        Smoothness = 2.0,
+        Smoothness = 1.0,
 
         VerticalLock          = false,
         VerticalLockThreshold = 15,
