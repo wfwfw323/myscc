@@ -54,7 +54,7 @@ local Config = {
         PredictionAmount = 0.100,
 
         AutoSwitch       = true,
-        WallCheck        = false,
+        WallCheck        = true,
         KOCheck          = true,
         TeamCheck        = true,
         WhitelistCheck   = true,
@@ -79,12 +79,12 @@ local Config = {
         SwitchHysteresis = 70,
 
         FOV = {
-            Visible     = true,
+            Visible     = false,
             Radius      = 300,
             IdleColor   = Color3.fromRGB(255, 255, 255),
             LockedColor = Color3.fromRGB(255, 70,  70),
             Thickness   = 1.5,
-            ShowDot     = true,
+            ShowDot     = false,
             DotRadius   = 3,
         },
     },
