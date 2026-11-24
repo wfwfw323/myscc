@@ -299,9 +299,9 @@ end
 
 local function applySpeedOffsetRule(baseOffset, speed)
     if speed <= 10 then
-        return baseOffset - 0.12
+        return baseOffset - 0.22
     elseif speed > 16 then
-        return baseOffset + 0.12
+        return baseOffset + 0.22
     end
     return baseOffset
 end
