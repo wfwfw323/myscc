@@ -59,7 +59,7 @@ local Config = {
         TeamCheck        = true,
         WhitelistCheck   = true,
         Whitelist        = {},
-        HoldM1ToTarget   = false,
+        HoldM1ToTarget   = true,
         IgnoreWhenEating = true,
 
         Smoothness = 2.0,
@@ -71,16 +71,16 @@ local Config = {
             Enabled   = true,
             CloseMax  = 15,
             MediumMax = 40,
-            CloseX    = 2.15,
+            CloseX    = 2.35,
             MediumX   = 1.85,
-            FarX      = 1.20,
+            FarX      = 3.20,
         },
 
         SwitchHysteresis = 70,
 
         FOV = {
             Visible     = true,
-            Radius      = 600,
+            Radius      = 300,
             IdleColor   = Color3.fromRGB(255, 255, 255),
             LockedColor = Color3.fromRGB(255, 70,  70),
             Thickness   = 1.5,
