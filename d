@@ -69,18 +69,18 @@ local Config = {
 
         AutoOffset = {
             Enabled   = true,
-            CloseMax  = 15,
-            MediumMax = 40,
-            CloseX    = 2.35,
+            CloseMax  = 5,
+            MediumMax = 30,
+            CloseX    = 2.45,
             MediumX   = 1.85,
-            FarX      = 3.20,
+            FarX      = 2.20,
         },
 
         SwitchHysteresis = 70,
 
         FOV = {
             Visible     = false,
-            Radius      = 300,
+            Radius      = 1200,
             IdleColor   = Color3.fromRGB(255, 255, 255),
             LockedColor = Color3.fromRGB(255, 70,  70),
             Thickness   = 1.5,
