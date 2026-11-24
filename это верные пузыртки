@@ -1,0 +1,2319 @@
+-- Da Hood: Flamethrower texture + flame color/width + 3D model + Config System (v28)
+-- Toggle GUI with Insert; draggable GUI; X/Y/Z sliders for 3D model; strict local-only burn styling.
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local InsertService    = game:GetService("InsertService")
+local HttpService      = game:GetService("HttpService")
+local player           = Players.LocalPlayer
+
+-- ============================================================
+-- CONFIG / STATE
+-- ============================================================
+local DEFAULT_TEXTURE = "rbxassetid://248625108"
+local DEFAULT_WIDTH   = 1
+local MY_BURN_RANGE   = 85
+local MY_SHOT_WINDOW  = 0.45
+local MIN_AIM_DOT     = 0.55
+local CONFIG_FOLDER   = "DaHoodFlameConfigs"
+local DEBUG           = false
+
+local selectedTexture = DEFAULT_TEXTURE
+local selectedColor   = Color3.fromRGB(139, 90, 43)
+local selectedWidth   = 1
+local selectedModelId = ""
+local customModelActive = false
+
+-- 3D model Scale & Position offset (in studs relative to anchor)
+local modelScale      = 1.0
+local modelOffsetPos  = Vector3.new(0, 0, 0)
+
+local selectedConfigName = ""
+
+local palette = {
+	Color3.fromRGB(255, 60, 60),  Color3.fromRGB(255, 120, 40),
+	Color3.fromRGB(255, 200, 40), Color3.fromRGB(255, 255, 60),
+	Color3.fromRGB(160, 255, 60), Color3.fromRGB(60, 220, 80),
+	Color3.fromRGB(40, 220, 180), Color3.fromRGB(60, 200, 255),
+	Color3.fromRGB(60, 120, 255), Color3.fromRGB(120, 80, 255),
+	Color3.fromRGB(180, 80, 255), Color3.fromRGB(255, 80, 220),
+	Color3.fromRGB(255, 120, 160),Color3.fromRGB(139, 90, 43),
+	Color3.fromRGB(255, 255, 255),Color3.fromRGB(50, 50, 50),
+}
+
+local original          = setmetatable({}, {__mode = "k"})
+local burnOriginal      = setmetatable({}, {__mode = "k"})
+local propOriginal      = setmetatable({}, {__mode = "k"})
+local partGuarded       = setmetatable({}, {__mode = "k"})
+local highlightOriginal = setmetatable({}, {__mode = "k"})
+local smokeOriginal     = setmetatable({}, {__mode = "k"})
+local guardedEmitters   = setmetatable({}, {__mode = "k"})
+local myOwnedBurn       = setmetatable({}, {__mode = "k"})
+local myBurnedChars     = setmetatable({}, {__mode = "k"})
+local hookedHumanoids   = setmetatable({}, {__mode = "k"})
+
+-- 3D replacement state
+local partVisualOrig  = setmetatable({}, {__mode = "k"})
+local spawned3DModels = {}
+
+local applyEnabled   = false
+local syncingProp    = false
+local syncingPart    = false
+local lastMyShotTime = 0
+local gui, panel, statusLabel, paletteHolder, colorPreview, widthLabel
+local scaleLabel, posXBox, posYBox, posZBox
+local setSliderX, setSliderY, setSliderZ
+local textureInputBox, modelIdInputBox, hexInputBox
+local configNameBox, configListFrame, refreshConfigListUI
+
+local function dbg(...)
+	if DEBUG then print("[DAHOOD-FLAME v28]", ...) end
+end
+
+-- ============================================================
+-- CREATOR STORE URL / ID PARSER
+-- ============================================================
+local function extractAssetId(value)
+	local raw = tostring(value or "")
+	if raw == "" then return nil end
+
+	local pathId = raw:match("/store/asset/(%d+)")
+		or raw:match("/catalog/(%d+)")
+		or raw:match("/library/(%d+)")
+		or raw:match("/bundles/(%d+)")
+		or raw:match("[?&]assetId=(%d+)")
+		or raw:match("[?&]id=(%d+)")
+	if pathId then
+		return pathId
+	end
+
+	local trimmed = raw:gsub("^%s+", ""):gsub("%s+$", "")
+	local directId = trimmed:match("^rbxassetid://(%d+)$") or trimmed:match("^(%d+)$")
+	if directId then
+		return directId
+	end
+
+	return raw:match("(%d+)")
+end
+
+local function normalizeAssetId(value)
+	local id = extractAssetId(value)
+	return id and ("rbxassetid://" .. id) or nil
+end
+
+-- ============================================================
+-- STRICT LOCAL OWNERSHIP & ANTI-OTHER-PLAYER BURN LEAK
+-- ============================================================
+local function getCharacterFromObj(obj)
+	local cur = obj
+	while cur do
+		if cur:IsA("Model") then
+			for _, plr in ipairs(Players:GetPlayers()) do
+				if plr.Character and cur == plr.Character then
+					return cur, plr
+				end
+			end
+		end
+		cur = cur.Parent
+	end
+	return nil, nil
+end
+
+local function isLocalPlayerCharacter(obj)
+	local char = getCharacterFromObj(obj)
+	return char ~= nil and char == player.Character
+end
+
+local function getAncestorTool(inst)
+	local cur = inst
+	while cur do
+		if cur:IsA("Tool") then return cur end
+		cur = cur.Parent
+	end
+	return nil
+end
+
+local function isMyTool(tool)
+	if not tool or not tool:IsA("Tool") then return false end
+	local parent = tool.Parent
+	if not parent then return false end
+	local myChar = player.Character
+	local myBackpack = player:FindFirstChildOfClass("Backpack")
+	return (myChar and parent == myChar) or (myBackpack and parent == myBackpack)
+end
+
+local function isMyEmitter(emitter)
+	if not emitter or not emitter.Parent then return false end
+	local tool = getAncestorTool(emitter)
+	return tool ~= nil and isMyTool(tool)
+end
+
+local function isAnyToolDescendant(inst)
+	return getAncestorTool(inst) ~= nil
+end
+
+local function isFlamethrowerContainer(inst)
+	if not inst then return false end
+	local n = string.lower(inst.Name)
+	return string.find(n, "flamethrower", 1, true) ~= nil
+		or string.find(n, "flame thrower", 1, true) ~= nil
+end
+
+local function getEquippedFlamethrowers()
+	local equipped = {}
+	local character = player.Character
+	if not character then return equipped end
+	for _, child in ipairs(character:GetChildren()) do
+		if child:IsA("Tool") then
+			local part = child:FindFirstChild("Part", true)
+			if isFlamethrowerContainer(child)
+				or (part and part:FindFirstChild("Flame") and part.Flame:IsA("ParticleEmitter")) then
+				table.insert(equipped, child)
+			end
+		end
+	end
+	return equipped
+end
+
+local function getWeaponRoots()
+	local roots, seen = {}, {}
+	local function add(tool)
+		if tool and tool:IsA("Tool") and not seen[tool] and isMyTool(tool) then
+			seen[tool] = true
+			table.insert(roots, tool)
+		end
+	end
+	local character = player.Character
+	local backpack  = player:FindFirstChildOfClass("Backpack")
+	if character then
+		for _, child in ipairs(character:GetChildren()) do
+			if child:IsA("Tool") then
+				local part = child:FindFirstChild("Part", true)
+				if isFlamethrowerContainer(child)
+					or (part and part:FindFirstChild("Flame") and part.Flame:IsA("ParticleEmitter")) then
+					add(child)
+				end
+			end
+		end
+	end
+	if backpack then
+		for _, child in ipairs(backpack:GetChildren()) do
+			if child:IsA("Tool") then
+				local part = child:FindFirstChild("Part", true)
+				if isFlamethrowerContainer(child) or (part and part:FindFirstChild("Flame", true)) then
+					add(child)
+				end
+			end
+		end
+	end
+	return roots
+end
+
+local function findEmitters()
+	local found, seen = {}, {}
+	for _, root in ipairs(getWeaponRoots()) do
+		for _, obj in ipairs(root:GetDescendants()) do
+			if obj:IsA("ParticleEmitter") and obj.Name == "Flame"
+				and obj.Parent and obj.Parent:IsA("BasePart") and not seen[obj]
+				and isMyEmitter(obj) then
+				seen[obj] = true
+				table.insert(found, obj)
+			end
+		end
+	end
+	return found
+end
+
+local function isFlameStreamActive()
+	for _, tool in ipairs(getEquippedFlamethrowers()) do
+		for _, desc in ipairs(tool:GetDescendants()) do
+			if desc:IsA("ParticleEmitter") and desc.Name == "Flame" and desc.Enabled then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function touchMyShot()
+	if #getEquippedFlamethrowers() > 0 then
+		lastMyShotTime = os.clock()
+	end
+end
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if input.KeyCode == Enum.KeyCode.Insert then
+		if panel then
+			panel.Visible = not panel.Visible
+			if statusLabel and statusLabel.Parent then
+				statusLabel.Text = panel.Visible and "GUI открыт (Insert)" or "GUI скрыт (Insert)"
+				statusLabel.TextColor3 = Color3.fromRGB(135, 235, 170)
+			end
+		end
+		return
+	end
+	if gameProcessed then return end
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		touchMyShot()
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		if #getEquippedFlamethrowers() > 0 then
+			lastMyShotTime = os.clock()
+		end
+	end
+end)
+
+RunService.Heartbeat:Connect(function()
+	if isFlameStreamActive() then
+		lastMyShotTime = os.clock()
+	end
+end)
+
+local function isMyActiveBurnWindow()
+	if #getEquippedFlamethrowers() == 0 then return false end
+	if isFlameStreamActive() then return true end
+	return (os.clock() - lastMyShotTime) <= MY_SHOT_WINDOW
+end
+
+local function resolveTargetPos(obj)
+	if not obj then return nil end
+	if obj:IsA("BasePart") then return obj.Position end
+	if obj:IsA("Attachment") then
+		local ok, cf = pcall(function() return obj.WorldCFrame end)
+		if ok and cf then return cf.Position end
+	end
+	local cur = obj.Parent
+	local guard = 0
+	while cur and guard < 12 do
+		if cur:IsA("BasePart") then return cur.Position end
+		if cur:IsA("Attachment") then
+			local ok, cf = pcall(function() return cur.WorldCFrame end)
+			if ok and cf then return cf.Position end
+		end
+		if cur:IsA("Model") then
+			local hrp = cur:FindFirstChild("HumanoidRootPart") or cur:FindFirstChildWhichIsA("BasePart")
+			if hrp then return hrp.Position end
+		end
+		cur = cur.Parent
+		guard += 1
+	end
+	return nil
+end
+
+local function resolveTargetRoot(obj)
+	if not obj then return nil end
+	if obj:IsA("BasePart") then return obj end
+	if obj:IsA("ParticleEmitter") or obj:IsA("Fire") or obj:IsA("Smoke") or obj:IsA("Highlight") or obj:IsA("Attachment") then
+		local cur = obj.Parent
+		local guard = 0
+		while cur and guard < 12 do
+			if cur:IsA("BasePart") then return cur end
+			if cur:IsA("Model") then
+				local hrp = cur:FindFirstChild("HumanoidRootPart") or cur:FindFirstChildWhichIsA("BasePart")
+				if hrp then return hrp end
+			end
+			cur = cur.Parent
+			guard += 1
+		end
+	end
+	return nil
+end
+
+local function isLikelyOtherPlayerFlame(obj)
+	local pos = resolveTargetPos(obj)
+	if not pos then return false end
+
+	local myRoot = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+	local myDist = myRoot and (pos - myRoot.Position).Magnitude or math.huge
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= player and plr.Character then
+			local otherRoot = plr.Character:FindFirstChild("HumanoidRootPart")
+			if otherRoot then
+				local hasActiveFlame = false
+				for _, child in ipairs(plr.Character:GetChildren()) do
+					if child:IsA("Tool") then
+						for _, desc in ipairs(child:GetDescendants()) do
+							if desc:IsA("ParticleEmitter") and desc.Name == "Flame" and desc.Enabled then
+								hasActiveFlame = true
+								break
+							end
+						end
+					end
+					if hasActiveFlame then break end
+				end
+
+				if hasActiveFlame then
+					local deltaOther = pos - otherRoot.Position
+					local distOther = deltaOther.Magnitude
+					if distOther <= MY_BURN_RANGE then
+						if distOther < myDist then
+							return true
+						end
+						if distOther > 1.5 and otherRoot.CFrame.LookVector:Dot(deltaOther.Unit) >= 0.45 then
+							return true
+						end
+					end
+				end
+			end
+		end
+	end
+	return false
+end
+
+local function matchesMyAimAndRange(obj)
+	if not isFlameStreamActive() and (os.clock() - lastMyShotTime) > MY_SHOT_WINDOW then
+		return false
+	end
+	if isLikelyOtherPlayerFlame(obj) then
+		return false
+	end
+
+	local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+	local pos = resolveTargetPos(obj)
+	if not root or not pos then return false end
+
+	local delta = pos - root.Position
+	local dist = delta.Magnitude
+	if dist > MY_BURN_RANGE then return false end
+	if dist < 1.5 then return true end
+
+	local unitDir = delta.Unit
+	local look = root.CFrame.LookVector
+	local cam = workspace.CurrentCamera
+	if cam then
+		local camLook = cam.CFrame.LookVector
+		local dotLook = look:Dot(unitDir)
+		local dotCam  = camLook:Dot(unitDir)
+		return math.max(dotLook, dotCam) >= MIN_AIM_DOT
+	end
+
+	return look:Dot(unitDir) >= MIN_AIM_DOT
+end
+
+local function isBlockedExternalEffect(obj)
+	if isAnyToolDescendant(obj) then return true end
+	if isLocalPlayerCharacter(obj) then return true end
+	return false
+end
+
+local function markCharacterBurnedByMe(char)
+	if not char or char == player.Character then return end
+	myBurnedChars[char] = true
+	for _, desc in ipairs(char:GetDescendants()) do
+		if desc:IsA("BasePart") or desc:IsA("ParticleEmitter") or desc:IsA("Fire") or desc:IsA("Smoke") or desc:IsA("Highlight") then
+			myOwnedBurn[desc] = true
+		end
+	end
+end
+
+local function isOwnedByMe(obj)
+	if not obj then return false end
+	if isBlockedExternalEffect(obj) then return false end
+
+	if myOwnedBurn[obj] then return true end
+
+	local targetChar = getCharacterFromObj(obj)
+	if targetChar and myBurnedChars[targetChar] then
+		myOwnedBurn[obj] = true
+		return true
+	end
+
+	local rootPart = resolveTargetRoot(obj)
+	if rootPart and isBlockedExternalEffect(rootPart) then return false end
+	if rootPart and myOwnedBurn[rootPart] then
+		myOwnedBurn[obj] = true
+		if targetChar then myBurnedChars[targetChar] = true end
+		return true
+	end
+
+	if isMyActiveBurnWindow() and matchesMyAimAndRange(obj) then
+		myOwnedBurn[obj] = true
+		if rootPart then myOwnedBurn[rootPart] = true end
+		if targetChar then markCharacterBurnedByMe(targetChar) end
+		return true
+	end
+	return false
+end
+
+local function isBurnEffectName(name)
+	local low = string.lower(tostring(name or ""))
+	return low == "flamethrowerfireparticle"
+		or string.find(low, "flamethrowerfire", 1, true) ~= nil
+		or string.find(low, "burn", 1, true) ~= nil
+		or string.find(low, "ignite", 1, true) ~= nil
+		or string.find(low, "fire", 1, true) ~= nil
+		or string.find(low, "flame", 1, true) ~= nil
+end
+
+local function colorSequenceFromSelected()
+	return ColorSequence.new(selectedColor)
+end
+
+local function scaleNumberSequence(seq, mult)
+	if not seq or mult == 1 then return seq end
+	local kps = {}
+	for _, pt in ipairs(seq.Keypoints) do
+		table.insert(kps, NumberSequenceKeypoint.new(
+			pt.Time,
+			math.max(0.05, pt.Value * mult),
+			pt.Envelope * mult
+		))
+	end
+	return NumberSequence.new(kps)
+end
+
+-- ============================================================
+-- 3D CREATOR STORE MODEL (NO COLLISIONS / NO PHYSICS LAUNCH + SCALE & POS)
+-- ============================================================
+local function getAnchorPart(tool)
+	if not tool then return nil end
+	local handle = tool:FindFirstChild("Handle")
+	if handle and handle:IsA("BasePart") then return handle end
+	for _, desc in ipairs(tool:GetDescendants()) do
+		if desc:IsA("BasePart") and not desc:FindFirstChild("Flame") then
+			return desc
+		end
+	end
+	return tool:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function getToolBodyParts(tool)
+	local parts = {}
+	if not tool then return parts end
+	for _, desc in ipairs(tool:GetDescendants()) do
+		if desc:IsA("BasePart") and not desc:FindFirstChild("Flame") then
+			table.insert(parts, desc)
+		end
+	end
+	return parts
+end
+
+local function savePartVisual(part)
+	if not part or not part:IsA("BasePart") or partVisualOrig[part] then return end
+	partVisualOrig[part] = {
+		Transparency = part.Transparency,
+	}
+end
+
+local function sanitizePartPhysics(part)
+	if not part or not part:IsA("BasePart") then return end
+	pcall(function()
+		part.Anchored = false
+		part.CanCollide = false
+		part.CanTouch = false
+		part.CanQuery = false
+		part.Massless = true
+		part.AssemblyLinearVelocity = Vector3.zero
+		part.AssemblyAngularVelocity = Vector3.zero
+	end)
+end
+
+local function stripPhysicsMovers(container)
+	if not container then return end
+	for _, desc in ipairs(container:GetDescendants()) do
+		if desc:IsA("Script")
+			or desc:IsA("LocalScript")
+			or desc:IsA("BodyMover")
+			or desc:IsA("Constraint")
+			or desc:IsA("LinearVelocity")
+			or desc:IsA("AngularVelocity")
+			or desc:IsA("VectorForce")
+			or desc:IsA("AlignPosition")
+			or desc:IsA("AlignOrientation") then
+			pcall(function() desc:Destroy() end)
+		end
+	end
+end
+
+local function update3DTransform(entry)
+	if not entry or not entry.root or not entry.primary or not entry.anchor then return end
+	if not entry.root.Parent or not entry.anchor.Parent then return end
+
+	for part, baseSize in pairs(entry.baseSizes) do
+		if part and part.Parent and part:IsA("BasePart") then
+			pcall(function()
+				part.Size = baseSize * modelScale
+				sanitizePartPhysics(part)
+			end)
+		end
+	end
+
+	local targetCF = entry.anchor.CFrame * CFrame.new(modelOffsetPos)
+	pcall(function()
+		if entry.weld then
+			entry.weld.Enabled = false
+		end
+		entry.primary.CFrame = targetCF
+		for part, relCF in pairs(entry.baseOffsets) do
+			if part and part.Parent and part ~= entry.primary and part:IsA("BasePart") then
+				part.CFrame = targetCF * CFrame.new(relCF.Position * modelScale) * relCF.Rotation
+			end
+		end
+		if entry.weld then
+			entry.weld.Enabled = true
+		end
+	end)
+end
+
+local function refreshAll3DTransforms()
+	for _, entry in ipairs(spawned3DModels) do
+		update3DTransform(entry)
+	end
+end
+
+local function clearCustom3D()
+	customModelActive = false
+
+	for i = #spawned3DModels, 1, -1 do
+		local entry = spawned3DModels[i]
+		table.remove(spawned3DModels, i)
+		if entry then
+			if entry.weld then pcall(function() entry.weld:Destroy() end) end
+			if entry.root then pcall(function() entry.root:Destroy() end) end
+		end
+	end
+
+	for part, orig in pairs(partVisualOrig) do
+		if part and part.Parent then
+			pcall(function()
+				part.Transparency = orig.Transparency
+			end)
+		end
+		partVisualOrig[part] = nil
+	end
+end
+
+local function fetchCreatorStoreAsset(assetUri)
+	local ok, objs = pcall(function()
+		return game:GetObjects(assetUri)
+	end)
+	if ok and type(objs) == "table" and #objs > 0 then
+		return objs
+	end
+	local ok2, loaded = pcall(function()
+		return InsertService:LoadLocalAsset(assetUri)
+	end)
+	if ok2 and loaded then
+		return { loaded }
+	end
+	return nil
+end
+
+local function extractTextureFromInstance(obj)
+	if not obj then return nil end
+	if obj:IsA("Decal") or obj:IsA("Texture") then
+		if obj.Texture and obj.Texture ~= "" then
+			return normalizeAssetId(obj.Texture) or obj.Texture
+		end
+	elseif obj:IsA("ImageLabel") or obj:IsA("ImageButton") then
+		if obj.Image and obj.Image ~= "" then
+			return normalizeAssetId(obj.Image) or obj.Image
+		end
+	elseif obj:IsA("ShirtGraphic") then
+		if obj.Graphic and obj.Graphic ~= "" then
+			return normalizeAssetId(obj.Graphic) or obj.Graphic
+		end
+	elseif obj:IsA("ParticleEmitter") then
+		if obj.Texture and obj.Texture ~= "" then
+			return normalizeAssetId(obj.Texture) or obj.Texture
+		end
+	elseif obj:IsA("MeshPart") then
+		if obj.TextureID and obj.TextureID ~= "" then
+			return normalizeAssetId(obj.TextureID) or obj.TextureID
+		end
+	elseif obj:IsA("SpecialMesh") then
+		if obj.TextureId and obj.TextureId ~= "" then
+			return normalizeAssetId(obj.TextureId) or obj.TextureId
+		end
+	end
+	return nil
+end
+
+local function resolveTextureUri(assetUri)
+	local objs = fetchCreatorStoreAsset(assetUri)
+	local foundId = assetUri
+	if objs then
+		for _, root in ipairs(objs) do
+			local candidates = { root }
+			for _, desc in ipairs(root:GetDescendants()) do
+				table.insert(candidates, desc)
+			end
+			for _, obj in ipairs(candidates) do
+				local tex = extractTextureFromInstance(obj)
+				if tex and tex ~= assetUri then
+					foundId = tex
+					break
+				end
+			end
+			pcall(function() root:Destroy() end)
+		end
+	end
+	return foundId
+end
+
+local function has3DContent(inst)
+	if not inst then return false end
+	if inst:IsA("BasePart") then return true end
+	if inst:IsA("Model") or inst:IsA("Accessory") or inst:IsA("Tool") then
+		return inst:FindFirstChildWhichIsA("BasePart", true) ~= nil
+	end
+	return false
+end
+
+local function prep3DInstance(inst, anchorPart)
+	if not inst or not anchorPart then return nil end
+	stripPhysicsMovers(inst)
+
+	local wrapper = inst
+	if inst:IsA("BasePart") then
+		local m = Instance.new("Model")
+		m.Name = "CreatorStore3DModel"
+		inst.Parent = m
+		m.PrimaryPart = inst
+		wrapper = m
+	elseif inst:IsA("Accessory") or inst:IsA("Tool") then
+		local m = Instance.new("Model")
+		m.Name = "CreatorStore3DModel"
+		for _, child in ipairs(inst:GetChildren()) do
+			child.Parent = m
+		end
+		local h = m:FindFirstChild("Handle") or m:FindFirstChildWhichIsA("BasePart", true)
+		if h and h:IsA("BasePart") then m.PrimaryPart = h end
+		pcall(function() inst:Destroy() end)
+		wrapper = m
+	elseif not inst:IsA("Model") then
+		return nil
+	end
+
+	local primary = wrapper.PrimaryPart or wrapper:FindFirstChildWhichIsA("BasePart", true)
+	if not primary then
+		wrapper:Destroy()
+		return nil
+	end
+	wrapper.PrimaryPart = primary
+
+	local baseSizes = {}
+	local baseOffsets = {}
+	local primaryCF = primary.CFrame
+
+	for _, desc in ipairs(wrapper:GetDescendants()) do
+		if desc:IsA("BasePart") then
+			sanitizePartPhysics(desc)
+			baseSizes[desc] = desc.Size
+			if desc ~= primary then
+				baseOffsets[desc] = primaryCF:ToObjectSpace(desc.CFrame)
+			end
+		end
+	end
+
+	wrapper.Parent = anchorPart.Parent
+	wrapper:PivotTo(anchorPart.CFrame * CFrame.new(modelOffsetPos))
+
+	for _, desc in ipairs(wrapper:GetDescendants()) do
+		if desc:IsA("BasePart") and desc ~= primary then
+			local w = Instance.new("WeldConstraint")
+			w.Part0 = primary
+			w.Part1 = desc
+			w.Parent = primary
+		end
+	end
+
+	local rootWeld = Instance.new("WeldConstraint")
+	rootWeld.Part0 = anchorPart
+	rootWeld.Part1 = primary
+	rootWeld.Parent = anchorPart
+
+	for part in pairs(baseSizes) do
+		part.ChildAdded:Connect(function(ch)
+			if ch:IsA("BasePart") then sanitizePartPhysics(ch) end
+		end)
+		part:GetPropertyChangedSignal("CanCollide"):Connect(function()
+			if part.CanCollide then part.CanCollide = false end
+		end)
+		part:GetPropertyChangedSignal("Massless"):Connect(function()
+			if not part.Massless then part.Massless = true end
+		end)
+	end
+
+	local entry = {
+		root = wrapper,
+		primary = primary,
+		anchor = anchorPart,
+		weld = rootWeld,
+		baseSizes = baseSizes,
+		baseOffsets = baseOffsets,
+	}
+	update3DTransform(entry)
+	return entry
+end
+
+local function apply3DModelFromStore(assetUri, silent)
+	local tools = getWeaponRoots()
+	if #tools == 0 then
+		if not silent then return false, "[Flamethrower] не найден в Character/Backpack." end
+		return false, ""
+	end
+
+	local objs = fetchCreatorStoreAsset(assetUri)
+	if not objs then
+		return false, "Не удалось загрузить 3D ассет (проверь ID или доступность)."
+	end
+
+	local found3DRoot = nil
+	for _, src in ipairs(objs) do
+		if has3DContent(src) then
+			found3DRoot = src
+			break
+		end
+	end
+
+	if not found3DRoot then
+		for _, src in ipairs(objs) do pcall(function() src:Destroy() end) end
+		return false, "В ассете не найдена 3D-модель / BasePart."
+	end
+
+	clearCustom3D()
+	customModelActive = true
+	selectedModelId = assetUri
+	local applied = 0
+
+	for _, tool in ipairs(tools) do
+		local anchor = getAnchorPart(tool)
+		if anchor then
+			for _, part in ipairs(getToolBodyParts(tool)) do
+				savePartVisual(part)
+				pcall(function() part.Transparency = 1 end)
+			end
+			local cloned = found3DRoot:Clone()
+			local entry = prep3DInstance(cloned, anchor)
+			if entry then
+				entry.tool = tool
+				table.insert(spawned3DModels, entry)
+				applied += 1
+			end
+		end
+	end
+
+	for _, src in ipairs(objs) do
+		pcall(function() src:Destroy() end)
+	end
+
+	if applied == 0 then
+		customModelActive = false
+		return false, "Не удалось прикрепить 3D модель."
+	end
+	return true, ("3D модель применена (%d)"):format(applied)
+end
+
+-- ============================================================
+-- STYLING + TARGETED BURN GUARD
+-- ============================================================
+local function rememberEmitter(emitter)
+	if not original[emitter] then
+		original[emitter] = {
+			Texture = emitter.Texture,
+			Color   = emitter.Color,
+			Size    = emitter.Size,
+		}
+	end
+end
+
+local function styleEmitter(emitter, isStream)
+	if not emitter or not emitter.Parent or syncingProp then return false end
+	if isStream then
+		if not isMyEmitter(emitter) then return false end
+	else
+		if not isOwnedByMe(emitter) then return false end
+	end
+
+	rememberEmitter(emitter)
+	local data = original[emitter]
+	if not data then return false end
+
+	local desiredTexture = selectedTexture
+	local desiredColor   = colorSequenceFromSelected()
+	local desiredSize    = scaleNumberSequence(data.Size, selectedWidth)
+
+	syncingProp = true
+	pcall(function()
+		emitter.Texture = desiredTexture
+		emitter.Color   = desiredColor
+		emitter.Size    = desiredSize
+	end)
+	syncingProp = false
+
+	if not guardedEmitters[emitter] then
+		guardedEmitters[emitter] = true
+		pcall(function()
+			emitter:GetPropertyChangedSignal("Color"):Connect(function()
+				if applyEnabled and not syncingProp and emitter.Parent and (isStream and isMyEmitter(emitter) or (not isStream and isOwnedByMe(emitter))) then
+					styleEmitter(emitter, isStream)
+				end
+			end)
+			emitter:GetPropertyChangedSignal("Texture"):Connect(function()
+				if applyEnabled and not syncingProp and emitter.Parent and (isStream and isMyEmitter(emitter) or (not isStream and isOwnedByMe(emitter))) then
+					styleEmitter(emitter, isStream)
+				end
+			end)
+		end)
+	end
+
+	return true
+end
+
+local function applyBurnPartColor(part)
+	if not part or not part.Parent or not part:IsA("BasePart") or syncingPart then return false end
+	if not isOwnedByMe(part) then return false end
+	if propOriginal[part] == nil then
+		propOriginal[part] = part.Color
+	end
+
+	syncingPart = true
+	pcall(function()
+		if part.Color ~= selectedColor then
+			part.Color = selectedColor
+		end
+	end)
+	syncingPart = false
+
+	if not partGuarded[part] then
+		partGuarded[part] = true
+		pcall(function()
+			part:GetPropertyChangedSignal("Color"):Connect(function()
+				if applyEnabled and not syncingPart and part.Parent and isOwnedByMe(part) then
+					applyBurnPartColor(part)
+				end
+			end)
+		end)
+	end
+
+	return true
+end
+
+local function applyToBurnFire(fire)
+	if not fire or not fire.Parent then return false end
+	if not isOwnedByMe(fire) then return false end
+	if burnOriginal[fire] == nil then
+		burnOriginal[fire] = {
+			Color = fire.Color,
+			SecondaryColor = fire.SecondaryColor,
+			Heat = fire.Heat,
+			Size = fire.Size,
+		}
+	end
+	pcall(function()
+		fire.Color          = selectedColor
+		fire.SecondaryColor = selectedColor
+	end)
+	return true
+end
+
+local function applyToBurnSmoke(smoke)
+	if not smoke or not smoke.Parent then return false end
+	if not isOwnedByMe(smoke) then return false end
+	if smokeOriginal[smoke] == nil then
+		smokeOriginal[smoke] = { Color = smoke.Color, Opacity = smoke.Opacity }
+	end
+	pcall(function() smoke.Color = selectedColor end)
+	return true
+end
+
+local function applyToBurnHighlight(h)
+	if not h or not h.Parent then return false end
+	if not isOwnedByMe(h) then return false end
+	if highlightOriginal[h] == nil then
+		highlightOriginal[h] = { FillColor = h.FillColor, OutlineColor = h.OutlineColor }
+	end
+	pcall(function()
+		h.FillColor    = selectedColor
+		h.OutlineColor = selectedColor
+	end)
+	return true
+end
+
+local function processBurnContainer(container)
+	if not container or not container.Parent then return false end
+	if not isOwnedByMe(container) then return false end
+	if container:IsA("BasePart") then
+		applyBurnPartColor(container)
+	end
+	local touched = false
+	for _, child in ipairs(container:GetDescendants()) do
+		if not isBlockedExternalEffect(child) then
+			if child:IsA("ParticleEmitter") and isBurnEffectName(child.Name) then
+				myOwnedBurn[child] = true
+				styleEmitter(child, false)
+				touched = true
+			elseif child:IsA("Fire") then
+				myOwnedBurn[child] = true
+				applyToBurnFire(child)
+				touched = true
+			elseif child:IsA("Smoke") then
+				myOwnedBurn[child] = true
+				applyToBurnSmoke(child)
+				touched = true
+			elseif child:IsA("Highlight") then
+				myOwnedBurn[child] = true
+				applyToBurnHighlight(child)
+				touched = true
+			end
+		end
+	end
+	return touched
+end
+
+local function routeBurnEffect(effect)
+	if not effect or not effect.Parent then return false end
+	if not isOwnedByMe(effect) then return false end
+
+	if effect:IsA("Fire") then
+		if effect.Parent and effect.Parent:IsA("BasePart") then applyBurnPartColor(effect.Parent) end
+		return applyToBurnFire(effect)
+	elseif effect:IsA("Smoke") then
+		if effect.Parent and effect.Parent:IsA("BasePart") then applyBurnPartColor(effect.Parent) end
+		return applyToBurnSmoke(effect)
+	elseif effect:IsA("Highlight") then
+		return applyToBurnHighlight(effect)
+	elseif effect:IsA("ParticleEmitter") then
+		if not isBurnEffectName(effect.Name) then return false end
+		if effect.Parent and effect.Parent:IsA("BasePart") then applyBurnPartColor(effect.Parent) end
+		return styleEmitter(effect, false)
+	end
+	return false
+end
+
+-- ============================================================
+-- DAMAGE / HIT DETECTION FOR MY IGNITED TARGETS
+-- ============================================================
+local function hookCharacterDamage(char)
+	if not char or char == player.Character then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum or hookedHumanoids[hum] then return end
+	hookedHumanoids[hum] = true
+
+	local lastHealth = hum.Health
+	hum.HealthChanged:Connect(function(newHealth)
+		if newHealth < lastHealth and applyEnabled and isMyActiveBurnWindow() then
+			local hrp = char:FindFirstChild("HumanoidRootPart") or char:FindFirstChildWhichIsA("BasePart")
+			if hrp and matchesMyAimAndRange(hrp) then
+				markCharacterBurnedByMe(char)
+				processBurnContainer(char)
+			end
+		end
+		lastHealth = newHealth
+	end)
+end
+
+local function bindAllPlayerCharacters()
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= player then
+			if plr.Character then hookCharacterDamage(plr.Character) end
+			plr.CharacterAdded:Connect(function(char)
+				hookCharacterDamage(char)
+			end)
+		end
+	end
+	Players.PlayerAdded:Connect(function(plr)
+		if plr ~= player then
+			plr.CharacterAdded:Connect(function(char)
+				hookCharacterDamage(char)
+			end)
+		end
+	end)
+end
+
+-- ============================================================
+-- SPAWN CATCHER
+-- ============================================================
+local pendingItems = {}
+local flushScheduled = false
+
+local function flushPending()
+	flushScheduled = false
+	if not applyEnabled then
+		table.clear(pendingItems)
+		return
+	end
+	for i = 1, #pendingItems do
+		local item = pendingItems[i]
+		pendingItems[i] = nil
+		if item and item.Parent and isOwnedByMe(item) then
+			if item:IsA("BasePart") or item:IsA("Model") then
+				processBurnContainer(item)
+			else
+				routeBurnEffect(item)
+			end
+		end
+	end
+end
+
+local function enqueueItem(item)
+	if not applyEnabled or not item then return end
+	if not isOwnedByMe(item) then return end
+	table.insert(pendingItems, item)
+	if not flushScheduled then
+		flushScheduled = true
+		RunService.Heartbeat:Once(flushPending)
+	end
+end
+
+workspace.DescendantAdded:Connect(function(desc)
+	if not applyEnabled then return end
+	if isBlockedExternalEffect(desc) then return end
+
+	local targetChar = getCharacterFromObj(desc)
+	local alreadyMyTarget = (targetChar and myBurnedChars[targetChar]) or myOwnedBurn[desc]
+	if not alreadyMyTarget and not isMyActiveBurnWindow() then return end
+
+	if desc:IsA("ParticleEmitter") then
+		if isBurnEffectName(desc.Name) then
+			enqueueItem(desc)
+		end
+	elseif desc:IsA("Fire") or desc:IsA("Smoke") or desc:IsA("Highlight") then
+		enqueueItem(desc)
+	elseif desc:IsA("BasePart") and desc.Name == "Clone" then
+		enqueueItem(desc)
+	end
+end)
+
+-- ============================================================
+-- APPLY / RESTORE VISUALS + RESPAWN PERSISTENCE
+-- ============================================================
+local function applyVisuals(silent)
+	applyEnabled = true
+	lastMyShotTime = os.clock()
+
+	local emitters = findEmitters()
+	local streamCount = 0
+	for _, emitter in ipairs(emitters) do
+		if styleEmitter(emitter, true) then
+			streamCount += 1
+		end
+	end
+
+	local burnedCount = 0
+	for part in pairs(propOriginal) do
+		if part and part.Parent and isOwnedByMe(part) and applyBurnPartColor(part) then
+			burnedCount += 1
+		end
+	end
+	for emitter in pairs(original) do
+		if emitter and emitter.Parent and not isMyEmitter(emitter) and isOwnedByMe(emitter) then
+			if styleEmitter(emitter, false) then burnedCount += 1 end
+		end
+	end
+	for fire in pairs(burnOriginal) do
+		if fire and fire.Parent and isOwnedByMe(fire) and applyToBurnFire(fire) then burnedCount += 1 end
+	end
+	for smoke in pairs(smokeOriginal) do
+		if smoke and smoke.Parent and isOwnedByMe(smoke) and applyToBurnSmoke(smoke) then burnedCount += 1 end
+	end
+	for h in pairs(highlightOriginal) do
+		if h and h.Parent and isOwnedByMe(h) and applyToBurnHighlight(h) then burnedCount += 1 end
+	end
+
+	if customModelActive and selectedModelId ~= "" then
+		apply3DModelFromStore(selectedModelId, true)
+	end
+
+	if streamCount == 0 and burnedCount == 0 then
+		if silent then return false, "" end
+		return false, "Flame пока не найден. Экипируй огнемёт."
+	end
+	return true, ("Струя: %d | Подожжено: %d"):format(streamCount, burnedCount)
+end
+
+local function restoreOriginal()
+	applyEnabled = false
+	selectedModelId = ""
+	lastMyShotTime = 0
+	table.clear(pendingItems)
+	table.clear(myOwnedBurn)
+	table.clear(myBurnedChars)
+	clearCustom3D()
+	local count = 0
+
+	for emitter, data in pairs(original) do
+		if emitter and emitter.Parent then
+			syncingProp = true
+			pcall(function()
+				emitter.Texture = data.Texture
+				emitter.Color   = data.Color
+				emitter.Size    = data.Size
+			end)
+			syncingProp = false
+			count += 1
+		end
+		original[emitter] = nil
+		guardedEmitters[emitter] = nil
+	end
+
+	for fire, data in pairs(burnOriginal) do
+		if fire and fire.Parent then
+			pcall(function()
+				fire.Color          = data.Color
+				fire.SecondaryColor = data.SecondaryColor
+				fire.Heat           = data.Heat
+				fire.Size           = data.Size
+			end)
+		end
+		burnOriginal[fire] = nil
+	end
+
+	for smoke, data in pairs(smokeOriginal) do
+		if smoke and smoke.Parent then
+			pcall(function()
+				smoke.Color   = data.Color
+				smoke.Opacity = data.Opacity
+			end)
+		end
+		smokeOriginal[smoke] = nil
+	end
+
+	for part, oldColor in pairs(propOriginal) do
+		if part and part.Parent then
+			syncingPart = true
+			pcall(function() part.Color = oldColor end)
+			syncingPart = false
+		end
+		propOriginal[part] = nil
+		partGuarded[part]  = nil
+	end
+
+	for h, data in pairs(highlightOriginal) do
+		if h and h.Parent then
+			pcall(function()
+				h.FillColor    = data.FillColor
+				h.OutlineColor = data.OutlineColor
+			end)
+		end
+		highlightOriginal[h] = nil
+	end
+
+	selectedTexture = DEFAULT_TEXTURE
+	selectedColor   = Color3.fromRGB(139, 90, 43)
+	selectedWidth   = DEFAULT_WIDTH
+	modelScale      = 1.0
+	modelOffsetPos  = Vector3.new(0, 0, 0)
+	return count
+end
+
+local function reapplyAfterRespawn()
+	if not applyEnabled and not customModelActive then return end
+	task.spawn(function()
+		local backpack = player:WaitForChild("Backpack", 10)
+		local char = player.Character or player.CharacterAdded:Wait()
+		for _ = 1, 20 do
+			if #getWeaponRoots() > 0 then break end
+			task.wait(0.25)
+		end
+		if applyEnabled then
+			local ok, msg = applyVisuals(true)
+			if ok and msg ~= "" and statusLabel then
+				statusLabel.Text = "Восстановлено после ресета | " .. msg
+				statusLabel.TextColor3 = Color3.fromRGB(135, 235, 170)
+			end
+		elseif customModelActive and selectedModelId ~= "" then
+			apply3DModelFromStore(selectedModelId, true)
+		end
+		if backpack then
+			backpack.ChildAdded:Connect(function(child)
+				if child:IsA("Tool") and (applyEnabled or customModelActive) then
+					task.wait(0.1)
+					if applyEnabled then applyVisuals(true) end
+				end
+			end)
+		end
+		if char then
+			char.ChildAdded:Connect(function(child)
+				if child:IsA("Tool") and (applyEnabled or customModelActive) then
+					task.wait(0.1)
+					if applyEnabled then applyVisuals(true) end
+				end
+			end)
+		end
+	end)
+end
+
+player.CharacterAdded:Connect(function()
+	table.clear(spawned3DModels)
+	customModelActive = (selectedModelId ~= "")
+	reapplyAfterRespawn()
+end)
+
+-- ============================================================
+-- EXECUTOR CONFIG SYSTEM (SAVE / LOAD / DELETE / LIST)
+-- ============================================================
+local function hasFileSupport()
+	return type(writefile) == "function" and type(readfile) == "function"
+end
+
+local function ensureConfigFolder()
+	if not hasFileSupport() then return false end
+	if type(isfolder) == "function" and type(makefolder) == "function" then
+		local ok, exists = pcall(isfolder, CONFIG_FOLDER)
+		if not ok or not exists then
+			pcall(makefolder, CONFIG_FOLDER)
+		end
+	end
+	return true
+end
+
+local function sanitizeConfigName(rawName)
+	local cleaned = tostring(rawName or "")
+		:gsub("^%s+", "")
+		:gsub("%s+$", "")
+		:gsub("%.json$", "")
+		:gsub("[^%w%-%_ ]", "")
+	if cleaned == "" then return nil end
+	return cleaned
+end
+
+local function configFilePath(cfgName)
+	return CONFIG_FOLDER .. "/" .. cfgName .. ".json"
+end
+
+local function listSavedConfigs()
+	local names = {}
+	if not ensureConfigFolder() or type(listfiles) ~= "function" then
+		return names
+	end
+	local ok, files = pcall(listfiles, CONFIG_FOLDER)
+	if not ok or type(files) ~= "table" then return names end
+
+	for _, fullPath in ipairs(files) do
+		local fileName = tostring(fullPath):match("([^/\\]+)$") or tostring(fullPath)
+		if fileName:match("%.json$") then
+			local cfgName = fileName:gsub("%.json$", "")
+			table.insert(names, cfgName)
+		end
+	end
+	table.sort(names)
+	return names
+end
+
+local function saveConfigToDisk(rawName)
+	if not hasFileSupport() then
+		return false, "Executor не поддерживает writefile/readfile."
+	end
+	local cfgName = sanitizeConfigName(rawName)
+	if not cfgName then
+		return false, "Введи корректное имя конфига."
+	end
+	ensureConfigFolder()
+
+	local payload = {
+		texture = selectedTexture,
+		color = {
+			r = math.floor(selectedColor.R * 255 + 0.5),
+			g = math.floor(selectedColor.G * 255 + 0.5),
+			b = math.floor(selectedColor.B * 255 + 0.5),
+		},
+		width = selectedWidth,
+		modelId = selectedModelId,
+		scale = modelScale,
+		position = {
+			x = modelOffsetPos.X,
+			y = modelOffsetPos.Y,
+			z = modelOffsetPos.Z,
+		},
+	}
+
+	local okEncode, encoded = pcall(function()
+		return HttpService:JSONEncode(payload)
+	end)
+	if not okEncode or not encoded then
+		return false, "Ошибка кодирования JSON."
+	end
+
+	local okWrite = pcall(writefile, configFilePath(cfgName), encoded)
+	if not okWrite then
+		return false, "Не удалось записать файл конфига."
+	end
+
+	selectedConfigName = cfgName
+	if refreshConfigListUI then refreshConfigListUI() end
+	return true, ("Конфиг '%s' сохранён."):format(cfgName)
+end
+
+local function loadConfigFromDisk(rawName)
+	if not hasFileSupport() then
+		return false, "Executor не поддерживает writefile/readfile."
+	end
+	local cfgName = sanitizeConfigName(rawName)
+	if not cfgName then
+		return false, "Выбери или введи имя конфига."
+	end
+
+	local path = configFilePath(cfgName)
+	local okRead, content = pcall(readfile, path)
+	if not okRead or not content or content == "" then
+		return false, ("Конфиг '%s' не найден."):format(cfgName)
+	end
+
+	local okDecode, data = pcall(function()
+		return HttpService:JSONDecode(content)
+	end)
+	if not okDecode or type(data) ~= "table" then
+		return false, ("Повреждённый JSON в '%s'."):format(cfgName)
+	end
+
+	if type(data.texture) == "string" and data.texture ~= "" then
+		selectedTexture = data.texture
+	end
+
+	if type(data.color) == "table" then
+		local r = tonumber(data.color.r) or 139
+		local g = tonumber(data.color.g) or 90
+		local b = tonumber(data.color.b) or 43
+		selectedColor = Color3.fromRGB(
+			math.clamp(math.floor(r), 0, 255),
+			math.clamp(math.floor(g), 0, 255),
+			math.clamp(math.floor(b), 0, 255)
+		)
+	end
+
+	if tonumber(data.width) then
+		selectedWidth = math.clamp(tonumber(data.width), 0.5, 4.0)
+	end
+
+	if type(data.modelId) == "string" then
+		selectedModelId = data.modelId
+		customModelActive = (selectedModelId ~= "")
+	end
+
+	if tonumber(data.scale) then
+		modelScale = math.clamp(tonumber(data.scale), 0.2, 5.0)
+	end
+
+	if type(data.position) == "table" then
+		modelOffsetPos = Vector3.new(
+			tonumber(data.position.x) or 0,
+			tonumber(data.position.y) or 0,
+			tonumber(data.position.z) or 0
+		)
+	end
+
+	selectedConfigName = cfgName
+
+	if textureInputBox then textureInputBox.Text = selectedTexture end
+	if modelIdInputBox then modelIdInputBox.Text = selectedModelId end
+	if widthLabel then widthLabel.Text = ("x%.1f"):format(selectedWidth) end
+	if scaleLabel then scaleLabel.Text = ("Scale %.1fx"):format(modelScale) end
+	if posXBox then posXBox.Text = tostring(modelOffsetPos.X) end
+	if posYBox then posYBox.Text = tostring(modelOffsetPos.Y) end
+	if posZBox then posZBox.Text = tostring(modelOffsetPos.Z) end
+	if setSliderX then setSliderX(modelOffsetPos.X, false) end
+	if setSliderY then setSliderY(modelOffsetPos.Y, false) end
+	if setSliderZ then setSliderZ(modelOffsetPos.Z, false) end
+	if colorPreview then colorPreview.BackgroundColor3 = selectedColor end
+	if hexInputBox then
+		hexInputBox.Text = string.format("#%02X%02X%02X",
+			math.floor(selectedColor.R * 255 + 0.5),
+			math.floor(selectedColor.G * 255 + 0.5),
+			math.floor(selectedColor.B * 255 + 0.5))
+	end
+
+	local okApply, applyMsg = applyVisuals()
+	if customModelActive and selectedModelId ~= "" then
+		local ok3D, msg3D = apply3DModelFromStore(selectedModelId, false)
+		refreshAll3DTransforms()
+		if ok3D then
+			return true, ("Загружен '%s' | %s"):format(cfgName, msg3D)
+		end
+	end
+
+	if okApply and applyMsg ~= "" then
+		return true, ("Загружен '%s' | %s"):format(cfgName, applyMsg)
+	end
+	return true, ("Загружен '%s' (настройки применены)."):format(cfgName)
+end
+
+local function deleteConfigFromDisk(rawName)
+	if type(delfile) ~= "function" then
+		return false, "Executor не поддерживает delfile."
+	end
+	local cfgName = sanitizeConfigName(rawName)
+	if not cfgName then
+		return false, "Выбери конфиг для удаления."
+	end
+	local path = configFilePath(cfgName)
+	local okDel = pcall(delfile, path)
+	if not okDel then
+		return false, ("Не удалось удалить '%s'."):format(cfgName)
+	end
+	if selectedConfigName == cfgName then
+		selectedConfigName = ""
+	end
+	if refreshConfigListUI then refreshConfigListUI() end
+	return true, ("Конфиг '%s' удалён."):format(cfgName)
+end
+
+-- ============================================================
+-- UI + DRAGGABLE + XYZ SLIDERS
+-- ============================================================
+local function setStatus(message, good)
+	if statusLabel and statusLabel.Parent then
+		statusLabel.Text = message
+		statusLabel.TextColor3 = good and Color3.fromRGB(135, 235, 170)
+			or Color3.fromRGB(255, 150, 150)
+	end
+end
+
+local function make(className, props, parent)
+	local obj = Instance.new(className)
+	for key, value in pairs(props or {}) do obj[key] = value end
+	obj.Parent = parent
+	return obj
+end
+
+local function round(obj, radius)
+	make("UICorner", { CornerRadius = UDim.new(0, radius) }, obj)
+end
+
+local function colorToHex(color)
+	return string.format("#%02X%02X%02X",
+		math.floor(color.R * 255 + 0.5),
+		math.floor(color.G * 255 + 0.5),
+		math.floor(color.B * 255 + 0.5))
+end
+
+local function parseHex(value)
+	local hex = tostring(value or ""):gsub("#", "")
+	if #hex ~= 6 or not hex:match("^%x%x%x%x%x%x$") then return nil end
+	return Color3.fromRGB(
+		tonumber(hex:sub(1, 2), 16),
+		tonumber(hex:sub(3, 4), 16),
+		tonumber(hex:sub(5, 6), 16))
+end
+
+local function parseNumber(value, fallback)
+	local cleaned = tostring(value or ""):gsub(",", "."):gsub("^%s+", ""):gsub("%s+$", "")
+	local n = tonumber(cleaned)
+	return n or fallback
+end
+
+local function makeDraggable(targetFrame, dragHandle)
+	local dragging = false
+	local dragInput = nil
+	local dragStart = Vector2.zero
+	local startPos = UDim2.new()
+
+	dragHandle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = targetFrame.Position
+			dragInput = input
+
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
+
+	dragHandle.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragInput = input
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if not dragging then return end
+		if input == dragInput
+			or input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch then
+			local delta = input.Position - dragStart
+			targetFrame.Position = UDim2.new(
+				startPos.X.Scale,
+				startPos.X.Offset + delta.X,
+				startPos.Y.Scale,
+				startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
+end
+
+local function createAxisSlider(parent, labelText, posY, minVal, maxVal, initialVal, onChanged)
+	make("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(15, posY),
+		Size = UDim2.fromOffset(22, 20),
+		Font = Enum.Font.GothamBold,
+		Text = labelText,
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = Color3.fromRGB(190, 205, 230)
+	}, parent)
+
+	local track = make("Frame", {
+		Position = UDim2.fromOffset(40, posY + 7),
+		Size = UDim2.fromOffset(286, 6),
+		BackgroundColor3 = Color3.fromRGB(36, 44, 62),
+		BorderSizePixel = 0
+	}, parent)
+	round(track, 3)
+
+	local fill = make("Frame", {
+		Position = UDim2.fromOffset(0, 0),
+		Size = UDim2.new(0.5, 0, 1, 0),
+		BackgroundColor3 = Color3.fromRGB(85, 130, 215),
+		BorderSizePixel = 0
+	}, track)
+	round(fill, 3)
+
+	local knob = make("TextButton", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 0),
+		Size = UDim2.fromOffset(14, 14),
+		BackgroundColor3 = Color3.fromRGB(235, 242, 255),
+		Text = "",
+		BorderSizePixel = 0,
+		AutoButtonColor = false
+	}, track)
+	round(knob, 7)
+
+	local box = make("TextBox", {
+		Position = UDim2.fromOffset(334, posY),
+		Size = UDim2.fromOffset(101, 20),
+		BackgroundColor3 = Color3.fromRGB(31, 38, 53),
+		TextColor3 = Color3.fromRGB(245, 247, 255),
+		Text = string.format("%.2f", initialVal),
+		ClearTextOnFocus = false,
+		Font = Enum.Font.GothamBold,
+		TextSize = 10,
+		BorderSizePixel = 0
+	}, parent)
+	round(box, 5)
+
+	local sliding = false
+
+	local function applyRatio(ratio, fireCallback)
+		ratio = math.clamp(ratio, 0, 1)
+		local rawVal = minVal + (maxVal - minVal) * ratio
+		local snapped = math.floor(rawVal * 20 + 0.5) / 20
+		local norm = (snapped - minVal) / (maxVal - minVal)
+		fill.Size = UDim2.new(norm, 0, 1, 0)
+		knob.Position = UDim2.new(norm, 0, 0.5, 0)
+		box.Text = string.format("%.2f", snapped)
+		if fireCallback and onChanged then
+			onChanged(snapped)
+		end
+	end
+
+	local function setValue(val, fireCallback)
+		local clamped = math.clamp(tonumber(val) or 0, minVal, maxVal)
+		local norm = (clamped - minVal) / (maxVal - minVal)
+		fill.Size = UDim2.new(norm, 0, 1, 0)
+		knob.Position = UDim2.new(norm, 0, 0.5, 0)
+		box.Text = string.format("%.2f", clamped)
+		if fireCallback and onChanged then
+			onChanged(clamped)
+		end
+	end
+
+	local function updateFromScreenX(screenX)
+		local absPos = track.AbsolutePosition.X
+		local absSize = math.max(1, track.AbsoluteSize.X)
+		applyRatio((screenX - absPos) / absSize, true)
+	end
+
+	track.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			sliding = true
+			updateFromScreenX(input.Position.X)
+		end
+	end)
+
+	knob.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			sliding = true
+		end
+	end)
+
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			sliding = false
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if sliding and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			updateFromScreenX(input.Position.X)
+		end
+	end)
+
+	box.FocusLost:Connect(function()
+		local num = parseNumber(box.Text, initialVal)
+		setValue(num, true)
+	end)
+
+	setValue(initialVal, false)
+	return box, setValue
+end
+
+local function refreshPalette()
+	if not paletteHolder then return end
+	for _, child in ipairs(paletteHolder:GetChildren()) do
+		if child:IsA("TextButton") then child:Destroy() end
+	end
+	for index, color in ipairs(palette) do
+		local swatch = make("TextButton", {
+			Name = "Color_" .. index,
+			Size = UDim2.fromOffset(30, 26),
+			BackgroundColor3 = color,
+			Text = "",
+			BorderSizePixel = 0,
+			AutoButtonColor = true,
+		}, paletteHolder)
+		round(swatch, 6)
+		make("UIStroke", {
+			Color = Color3.fromRGB(235, 240, 255),
+			Transparency = color == selectedColor and 0 or 0.75,
+			Thickness = color == selectedColor and 2 or 1
+		}, swatch)
+		swatch.Activated:Connect(function()
+			selectedColor = color
+			if colorPreview then colorPreview.BackgroundColor3 = color end
+			if hexInputBox then hexInputBox.Text = colorToHex(color) end
+			local ok, message = applyVisuals()
+			setStatus(message, ok)
+			refreshPalette()
+		end)
+	end
+end
+
+local function syncPositionFromBoxes()
+	if not posXBox or not posYBox or not posZBox then return end
+	local x = parseNumber(posXBox.Text, modelOffsetPos.X)
+	local y = parseNumber(posYBox.Text, modelOffsetPos.Y)
+	local z = parseNumber(posZBox.Text, modelOffsetPos.Z)
+	modelOffsetPos = Vector3.new(x, y, z)
+	if setSliderX then setSliderX(x, false) end
+	if setSliderY then setSliderY(y, false) end
+	if setSliderZ then setSliderZ(z, false) end
+	refreshAll3DTransforms()
+end
+
+local function createGui()
+	local playerGui = player:WaitForChild("PlayerGui")
+	local old = playerGui:FindFirstChild("DaHoodFlameTextureUI")
+	if old then old:Destroy() end
+
+	gui = make("ScreenGui", {
+		Name = "DaHoodFlameTextureUI",
+		ResetOnSpawn = false,
+		IgnoreGuiInset = true
+	}, playerGui)
+
+	panel = make("Frame", {
+		Name = "Panel",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(450, 745),
+		BackgroundColor3 = Color3.fromRGB(18, 23, 34),
+		BorderSizePixel = 0,
+	}, gui)
+	round(panel, 13)
+	make("UIStroke", { Color = Color3.fromRGB(76, 105, 155), Transparency = 0.2, Thickness = 1.4 }, panel)
+
+	local headerBar = make("Frame", {
+		Name = "Header",
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(15, 7),
+		Size = UDim2.new(1, -60, 0, 28),
+	}, panel)
+
+	make("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(0, 0),
+		Size = UDim2.new(1, 0, 1, 0),
+		Font = Enum.Font.GothamBold,
+		Text = "DA HOOD  /  FLAME CUSTOMIZER v28  [DRAG / INSERT]",
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = Color3.fromRGB(240, 244, 255)
+	}, headerBar)
+
+	makeDraggable(panel, headerBar)
+
+	local close = make("TextButton", {
+		Position = UDim2.new(1, -39, 0, 8),
+		Size = UDim2.fromOffset(29, 26),
+		BackgroundColor3 = Color3.fromRGB(130, 55, 65),
+		Text = "×", TextSize = 18,
+		Font = Enum.Font.GothamBold,
+		TextColor3 = Color3.new(1, 1, 1),
+		BorderSizePixel = 0
+	}, panel)
+	round(close, 7)
+	close.Activated:Connect(function() panel.Visible = false end)
+
+	-- Текстура струи
+	make("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(15, 38),
+		Size = UDim2.new(1, -30, 0, 16),
+		Font = Enum.Font.Gotham,
+		Text = "ТЕКСТУРА СТРУИ — Creator Store Link или ID",
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = Color3.fromRGB(180, 190, 210)
+	}, panel)
+
+	textureInputBox = make("TextBox", {
+		Position = UDim2.fromOffset(15, 56),
+		Size = UDim2.new(1, -30, 0, 26),
+		BackgroundColor3 = Color3.fromRGB(31, 38, 53),
+		TextColor3 = Color3.fromRGB(245, 247, 255),
+		PlaceholderColor3 = Color3.fromRGB(135, 145, 165),
+		PlaceholderText = "Ссылка Creator Store или Asset ID",
+		Text = "", ClearTextOnFocus = false,
+		Font = Enum.Font.Gotham, TextSize = 12,
+		BorderSizePixel = 0
+	}, panel)
+	round(textureInputBox, 7)
+
+	local applyTextureButton = make("TextButton", {
+		Position = UDim2.fromOffset(15, 87),
+		Size = UDim2.fromOffset(185, 25),
+		BackgroundColor3 = Color3.fromRGB(55, 105, 185),
+		Text = "APPLY TEXTURE",
+		TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamBold, TextSize = 11,
+		BorderSizePixel = 0
+	}, panel)
+	round(applyTextureButton, 7)
+
+	-- Палитра цветов
+	make("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(15, 117),
+		Size = UDim2.new(1, -30, 0, 16),
+		Font = Enum.Font.GothamBold,
+		Text = "ЦВЕТОВАЯ ПАЛИТРА  ·  выбери цвет струи",
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = Color3.fromRGB(220, 230, 250)
+	}, panel)
+
+	colorPreview = make("Frame", {
+		Position = UDim2.fromOffset(15, 136),
+		Size = UDim2.fromOffset(32, 25),
+		BackgroundColor3 = selectedColor,
+		BorderSizePixel = 0
+	}, panel)
+	round(colorPreview, 6)
+
+	hexInputBox = make("TextBox", {
+		Position = UDim2.fromOffset(55, 136),
+		Size = UDim2.fromOffset(105, 25),
+		BackgroundColor3 = Color3.fromRGB(31, 38, 53),
+		TextColor3 = Color3.fromRGB(245, 247, 255),
+		PlaceholderText = "#8B5A2B",
+		Text = colorToHex(selectedColor),
+		ClearTextOnFocus = false,
+		Font = Enum.Font.Gotham, TextSize = 12,
+		BorderSizePixel = 0
+	}, panel)
+	round(hexInputBox, 6)
+
+	local addColor = make("TextButton", {
+		Position = UDim2.fromOffset(168, 136),
+		Size = UDim2.fromOffset(122, 25),
+		BackgroundColor3 = Color3.fromRGB(62, 130, 100),
+		Text = "ADD TO PALETTE",
+		TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamBold, TextSize = 10,
+		BorderSizePixel = 0
+	}, panel)
+	round(addColor, 6)
+
+	local applyColor = make("TextButton", {
+		Position = UDim2.fromOffset(298, 136),
+		Size = UDim2.fromOffset(137, 25),
+		BackgroundColor3 = Color3.fromRGB(55, 105, 185),
+		Text = "APPLY COLOR",
+		TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamBold, TextSize = 10,
+		BorderSizePixel = 0
+	}, panel)
+	round(applyColor, 6)
+
+	paletteHolder = make("Frame", {
+		Position = UDim2.fromOffset(15, 166),
+		Size = UDim2.new(1, -30, 0, 110),
+		BackgroundTransparency = 1
+	}, panel)
+	make("UIGridLayout", {
+		CellSize = UDim2.fromOffset(30, 23),
+		CellPadding = UDim2.fromOffset(7, 5),
+		SortOrder = Enum.SortOrder.LayoutOrder
+	}, paletteHolder)
+
+	-- Ширина струи
+	make("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(15, 281),
+		Size = UDim2.new(1, -30, 0, 16),
+		Font = Enum.Font.GothamBold,
+		Text = "ШИРИНА СТРУИ",
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = Color3.fromRGB(220, 230, 250)
+	}, panel)
+
+	local minus = make("TextButton", {
+		Position = UDim2.fromOffset(15, 299),
+		Size = UDim2.fromOffset(32, 24),
+		BackgroundColor3 = Color3.fromRGB(65, 73, 91),
+		Text = "−", TextColor3 = Color3.new(1, 1, 1),
+		TextSize = 18, Font = Enum.Font.GothamBold,
+		BorderSizePixel = 0
+	}, panel)
+	round(minus, 6)
+
+	widthLabel = make("TextLabel", {
+		Position = UDim2.fromOffset(55, 299),
+		Size = UDim2.fromOffset(96, 24),
+		BackgroundColor3 = Color3.fromRGB(31, 38, 53),
+		Text = "x1.0",
+		TextColor3 = Color3.fromRGB(245, 247, 255),
+		Font = Enum.Font.GothamBold, TextSize = 12,
+		BorderSizePixel = 0
+	}, panel)
+	round(widthLabel, 6)
+
+	local plus = make("TextButton", {
+		Position = UDim2.fromOffset(159, 299),
+		Size = UDim2.fromOffset(32, 24),
+		BackgroundColor3 = Color3.fromRGB(65, 73, 91),
+		Text = "+", TextColor3 = Color3.new(1, 1, 1),
+		TextSize = 18, Font = Enum.Font.GothamBold,
+		BorderSizePixel = 0
+	}, panel)
+	round(plus, 6)
+
+	make("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(200, 299),
+		Size = UDim2.new(1, -215, 0, 24),
+		Font = Enum.Font.Gotham,
+		Text = "От 0.5x до 4x",
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = Color3.fromRGB(165, 175, 195)
+	}, panel)
+
+	-- 3D модель из Creator Store (без коллизий)
+	make("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(15, 329),
+		Size = UDim2.new(1, -30, 0, 16),
+		Font = Enum.Font.GothamBold,
+		Text = "3D МОДЕЛЬ (Creator Store Link или ID · No Collision)",
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = Color3.fromRGB(220, 230, 250)
+	}, panel)
+
+	modelIdInputBox = make("TextBox", {
+		Position = UDim2.fromOffset(15, 347),
+		Size = UDim2.new(1, -30, 0, 24),
+		BackgroundColor3 = Color3.fromRGB(31, 38, 53),
+		TextColor3 = Color3.fromRGB(245, 247, 255),
+		PlaceholderColor3 = Color3.fromRGB(135, 145, 165),
+		PlaceholderText = "https://create.roblox.com/store/asset/... или ID",
+		Text = "", ClearTextOnFocus = false,
+		Font = Enum.Font.Gotham, TextSize = 12,
+		BorderSizePixel = 0
+	}, panel)
+	round(modelIdInputBox, 6)
+
+	local scaleMinus = make("TextButton", {
+		Position = UDim2.fromOffset(15, 376),
+		Size = UDim2.fromOffset(26, 22),
+		BackgroundColor3 = Color3.fromRGB(65, 73, 91),
+		Text = "−", TextColor3 = Color3.new(1, 1, 1),
+		TextSize = 16, Font = Enum.Font.GothamBold,
+		BorderSizePixel = 0
+	}, panel)
+	round(scaleMinus, 6)
+
+	scaleLabel = make("TextLabel", {
+		Position = UDim2.fromOffset(45, 376),
+		Size = UDim2.fromOffset(82, 22),
+		BackgroundColor3 = Color3.fromRGB(31, 38, 53),
+		Text = "Scale 1.0x",
+		TextColor3 = Color3.fromRGB(245, 247, 255),
+		Font = Enum.Font.GothamBold, TextSize = 11,
+		BorderSizePixel = 0
+	}, panel)
+	round(scaleLabel, 6)
+
+	local scalePlus = make("TextButton", {
+		Position = UDim2.fromOffset(131, 376),
+		Size = UDim2.fromOffset(26, 22),
+		BackgroundColor3 = Color3.fromRGB(65, 73, 91),
+		Text = "+", TextColor3 = Color3.new(1, 1, 1),
+		TextSize = 16, Font = Enum.Font.GothamBold,
+		BorderSizePixel = 0
+	}, panel)
+	round(scalePlus, 6)
+
+	posXBox, setSliderX = createAxisSlider(panel, "X", 402, -8, 8, modelOffsetPos.X, function(val)
+		modelOffsetPos = Vector3.new(val, modelOffsetPos.Y, modelOffsetPos.Z)
+		refreshAll3DTransforms()
+	end)
+
+	posYBox, setSliderY = createAxisSlider(panel, "Y", 425, -8, 8, modelOffsetPos.Y, function(val)
+		modelOffsetPos = Vector3.new(modelOffsetPos.X, val, modelOffsetPos.Z)
+		refreshAll3DTransforms()
+	end)
+
+	posZBox, setSliderZ = createAxisSlider(panel, "Z", 448, -8, 8, modelOffsetPos.Z, function(val)
+		modelOffsetPos = Vector3.new(modelOffsetPos.X, modelOffsetPos.Y, val)
+		refreshAll3DTransforms()
+	end)
+
+	local applyModelBtn = make("TextButton", {
+		Position = UDim2.fromOffset(15, 474),
+		Size = UDim2.fromOffset(275, 24),
+		BackgroundColor3 = Color3.fromRGB(82, 98, 175),
+		Text = "APPLY 3D MODEL",
+		TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamBold, TextSize = 11,
+		BorderSizePixel = 0
+	}, panel)
+	round(applyModelBtn, 6)
+
+	local clearModelBtn = make("TextButton", {
+		Position = UDim2.fromOffset(298, 474),
+		Size = UDim2.fromOffset(137, 24),
+		BackgroundColor3 = Color3.fromRGB(72, 62, 85),
+		Text = "CLEAR 3D",
+		TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamBold, TextSize = 10,
+		BorderSizePixel = 0
+	}, panel)
+	round(clearModelBtn, 6)
+
+	-- ============================================================
+	-- CONFIG SYSTEM UI (SAVE / LOAD / DELETE / LIST)
+	-- ============================================================
+	make("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(15, 503),
+		Size = UDim2.new(1, -30, 0, 16),
+		Font = Enum.Font.GothamBold,
+		Text = "КОНФИГИ (Папка: " .. CONFIG_FOLDER .. ")",
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = Color3.fromRGB(220, 230, 250)
+	}, panel)
+
+	configNameBox = make("TextBox", {
+		Position = UDim2.fromOffset(15, 521),
+		Size = UDim2.fromOffset(195, 24),
+		BackgroundColor3 = Color3.fromRGB(31, 38, 53),
+		TextColor3 = Color3.fromRGB(245, 247, 255),
+		PlaceholderColor3 = Color3.fromRGB(135, 145, 165),
+		PlaceholderText = "Имя конфига (напр. preset1)",
+		Text = "",
+		ClearTextOnFocus = false,
+		Font = Enum.Font.Gotham, TextSize = 11,
+		BorderSizePixel = 0
+	}, panel)
+	round(configNameBox, 6)
+
+	local saveCfgBtn = make("TextButton", {
+		Position = UDim2.fromOffset(216, 521),
+		Size = UDim2.fromOffset(68, 24),
+		BackgroundColor3 = Color3.fromRGB(52, 130, 95),
+		Text = "SAVE",
+		TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamBold, TextSize = 10,
+		BorderSizePixel = 0
+	}, panel)
+	round(saveCfgBtn, 6)
+
+	local loadCfgBtn = make("TextButton", {
+		Position = UDim2.fromOffset(290, 521),
+		Size = UDim2.fromOffset(68, 24),
+		BackgroundColor3 = Color3.fromRGB(55, 105, 185),
+		Text = "LOAD",
+		TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamBold, TextSize = 10,
+		BorderSizePixel = 0
+	}, panel)
+	round(loadCfgBtn, 6)
+
+	local delCfgBtn = make("TextButton", {
+		Position = UDim2.fromOffset(364, 521),
+		Size = UDim2.fromOffset(71, 24),
+		BackgroundColor3 = Color3.fromRGB(140, 58, 68),
+		Text = "DELETE",
+		TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamBold, TextSize = 10,
+		BorderSizePixel = 0
+	}, panel)
+	round(delCfgBtn, 6)
+
+	configListFrame = make("ScrollingFrame", {
+		Position = UDim2.fromOffset(15, 550),
+		Size = UDim2.new(1, -30, 0, 86),
+		BackgroundColor3 = Color3.fromRGB(24, 30, 44),
+		BorderSizePixel = 0,
+		ScrollBarThickness = 5,
+		CanvasSize = UDim2.fromOffset(0, 0),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y
+	}, panel)
+	round(configListFrame, 7)
+	make("UIStroke", { Color = Color3.fromRGB(58, 78, 115), Transparency = 0.35, Thickness = 1 }, configListFrame)
+
+	make("UIListLayout", {
+		Padding = UDim.new(0, 4),
+		SortOrder = Enum.SortOrder.LayoutOrder
+	}, configListFrame)
+	make("UIPadding", {
+		PaddingTop = UDim.new(0, 5),
+		PaddingBottom = UDim.new(0, 5),
+		PaddingLeft = UDim.new(0, 6),
+		PaddingRight = UDim.new(0, 6),
+	}, configListFrame)
+
+	refreshConfigListUI = function()
+		if not configListFrame then return end
+		for _, child in ipairs(configListFrame:GetChildren()) do
+			if child:IsA("TextButton") or child:IsA("TextLabel") then
+				child:Destroy()
+			end
+		end
+
+		local names = listSavedConfigs()
+		if #names == 0 then
+			make("TextLabel", {
+				BackgroundTransparency = 1,
+				Size = UDim2.new(1, 0, 0, 24),
+				Font = Enum.Font.Gotham,
+				Text = "Сохранённых конфигов пока нет.",
+				TextSize = 11,
+				TextColor3 = Color3.fromRGB(150, 162, 185)
+			}, configListFrame)
+			return
+		end
+
+		for idx, cfgName in ipairs(names) do
+			local isSelected = (cfgName == selectedConfigName)
+			local itemBtn = make("TextButton", {
+				Name = "Cfg_" .. idx,
+				Size = UDim2.new(1, 0, 0, 24),
+				BackgroundColor3 = isSelected and Color3.fromRGB(62, 112, 190) or Color3.fromRGB(35, 43, 62),
+				Text = cfgName .. ".json",
+				TextColor3 = Color3.new(1, 1, 1),
+				Font = isSelected and Enum.Font.GothamBold or Enum.Font.Gotham,
+				TextSize = 11,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				BorderSizePixel = 0,
+			}, configListFrame)
+			round(itemBtn, 5)
+			make("UIPadding", { PaddingLeft = UDim.new(0, 8) }, itemBtn)
+
+			itemBtn.Activated:Connect(function()
+				selectedConfigName = cfgName
+				if configNameBox then configNameBox.Text = cfgName end
+				refreshConfigListUI()
+				setStatus(("Выбран конфиг '%s'."):format(cfgName), true)
+			end)
+		end
+	end
+
+	-- Основные кнопки
+	local applyAllButton = make("TextButton", {
+		Position = UDim2.fromOffset(15, 644),
+		Size = UDim2.fromOffset(212, 30),
+		BackgroundColor3 = Color3.fromRGB(52, 145, 95),
+		Text = "APPLY ALL",
+		TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamBold, TextSize = 12,
+		BorderSizePixel = 0
+	}, panel)
+	round(applyAllButton, 7)
+
+	local resetButton = make("TextButton", {
+		Position = UDim2.fromOffset(235, 644),
+		Size = UDim2.fromOffset(200, 30),
+		BackgroundColor3 = Color3.fromRGB(125, 58, 68),
+		Text = "RESET ORIGINAL",
+		TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamBold, TextSize = 12,
+		BorderSizePixel = 0
+	}, panel)
+	round(resetButton, 7)
+
+	statusLabel = make("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(15, 682),
+		Size = UDim2.new(1, -30, 0, 52),
+		Font = Enum.Font.GothamMedium,
+		Text = "Готово: чужой огонь остаётся дефолтным, GUI двигается, XYZ — ползунки.",
+		TextSize = 11,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = Color3.fromRGB(135, 235, 170)
+	}, panel)
+
+	applyTextureButton.Activated:Connect(function()
+		local rawId = extractAssetId(textureInputBox.Text)
+		local normalized = normalizeAssetId(textureInputBox.Text)
+		if normalized then
+			selectedTexture = resolveTextureUri(normalized)
+			local ok, msg = applyVisuals()
+			setStatus(("ID %s -> %s"):format(rawId, msg), ok)
+		else
+			setStatus("Некорректная ссылка или ID текстуры.", false)
+		end
+	end)
+
+	hexInputBox.FocusLost:Connect(function()
+		local parsed = parseHex(hexInputBox.Text)
+		if parsed then
+			selectedColor = parsed
+			colorPreview.BackgroundColor3 = parsed
+			refreshPalette()
+		end
+	end)
+
+	addColor.Activated:Connect(function()
+		local parsed = parseHex(hexInputBox.Text) or selectedColor
+		selectedColor = parsed
+		colorPreview.BackgroundColor3 = parsed
+		hexInputBox.Text = colorToHex(parsed)
+		table.insert(palette, parsed)
+		refreshPalette()
+		setStatus("Цвет добавлен в палитру.", true)
+	end)
+
+	applyColor.Activated:Connect(function()
+		local parsed = parseHex(hexInputBox.Text)
+		if parsed then
+			selectedColor = parsed
+			colorPreview.BackgroundColor3 = parsed
+		end
+		local ok, msg = applyVisuals()
+		setStatus(msg, ok)
+		refreshPalette()
+	end)
+
+	local function updateWidth(delta)
+		selectedWidth = math.clamp(math.floor((selectedWidth + delta) * 10 + 0.5) / 10, 0.5, 4.0)
+		widthLabel.Text = ("x%.1f"):format(selectedWidth)
+		if applyEnabled then
+			local ok, msg = applyVisuals()
+			setStatus(msg, ok)
+		end
+	end
+
+	minus.Activated:Connect(function() updateWidth(-0.5) end)
+	plus.Activated:Connect(function() updateWidth(0.5) end)
+
+	local function updateScale(delta)
+		modelScale = math.clamp(math.floor((modelScale + delta) * 10 + 0.5) / 10, 0.2, 5.0)
+		scaleLabel.Text = ("Scale %.1fx"):format(modelScale)
+		refreshAll3DTransforms()
+		setStatus(("3D Scale: %.1fx"):format(modelScale), true)
+	end
+
+	scaleMinus.Activated:Connect(function() updateScale(-0.2) end)
+	scalePlus.Activated:Connect(function() updateScale(0.2) end)
+
+	applyModelBtn.Activated:Connect(function()
+		local rawId = extractAssetId(modelIdInputBox.Text)
+		local uri = normalizeAssetId(modelIdInputBox.Text)
+		if not uri then
+			setStatus("Вставь корректную ссылку Creator Store или ID.", false)
+			return
+		end
+		syncPositionFromBoxes()
+		selectedModelId = uri
+		local ok, msg = apply3DModelFromStore(uri, false)
+		setStatus(("ID %s: %s"):format(rawId, msg), ok)
+	end)
+
+	clearModelBtn.Activated:Connect(function()
+		selectedModelId = ""
+		clearCustom3D()
+		setStatus("3D модель снята, огнемёт возвращён.", true)
+	end)
+
+	saveCfgBtn.Activated:Connect(function()
+		syncPositionFromBoxes()
+		local targetName = (configNameBox.Text ~= "" and configNameBox.Text) or selectedConfigName
+		local ok, msg = saveConfigToDisk(targetName)
+		setStatus(msg, ok)
+	end)
+
+	loadCfgBtn.Activated:Connect(function()
+		local targetName = (configNameBox.Text ~= "" and configNameBox.Text) or selectedConfigName
+		local ok, msg = loadConfigFromDisk(targetName)
+		setStatus(msg, ok)
+	end)
+
+	delCfgBtn.Activated:Connect(function()
+		local targetName = (selectedConfigName ~= "" and selectedConfigName) or configNameBox.Text
+		local ok, msg = deleteConfigFromDisk(targetName)
+		setStatus(msg, ok)
+	end)
+
+	applyAllButton.Activated:Connect(function()
+		local parsed = parseHex(hexInputBox.Text)
+		if parsed then
+			selectedColor = parsed
+			colorPreview.BackgroundColor3 = parsed
+		end
+		local normalized = normalizeAssetId(textureInputBox.Text)
+		if normalized then
+			selectedTexture = resolveTextureUri(normalized)
+		end
+		syncPositionFromBoxes()
+		local ok, msg = applyVisuals()
+		setStatus(msg, ok)
+		refreshPalette()
+	end)
+
+	resetButton.Activated:Connect(function()
+		local restored = restoreOriginal()
+		selectedWidth = DEFAULT_WIDTH
+		widthLabel.Text = "x1.0"
+		scaleLabel.Text = "Scale 1.0x"
+		if setSliderX then setSliderX(0, false) end
+		if setSliderY then setSliderY(0, false) end
+		if setSliderZ then setSliderZ(0, false) end
+		colorPreview.BackgroundColor3 = selectedColor
+		hexInputBox.Text = colorToHex(selectedColor)
+		refreshPalette()
+		setStatus(("Сброшено (%d)."):format(restored), true)
+	end)
+
+	refreshPalette()
+	refreshConfigListUI()
+end
+
+bindAllPlayerCharacters()
+createGui()
+reapplyAfterRespawn()
